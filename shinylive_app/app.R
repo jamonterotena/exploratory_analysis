@@ -41,10 +41,13 @@ TARGET_COLS <- c("cM_Mbp", "cM_Mbp_sex_avg")
 REC_SUFFIX <- "_recombinogenic"
 is_rate_col <- function(v) v %in% c(TARGET_COLS, paste0(TARGET_COLS, REC_SUFFIX))
 
-# Variables plotted by default, in this order (missing ones are skipped).
-DEFAULT_PLOT_VARS <- c("cM_Mbp", "SYN", "INV",
-                       "GA_P1", "TE_P1", "CHR_P1", "POS_P1",
-                       "GA_P2", "TE_P2", "CHR_P2", "POS_P2")
+# Variables plotted by default, in this order (missing ones are skipped): the parent
+# averages (GA = mean of GA_P1 and GA_P2, ...). Tables without averages fall back to the
+# parental features.
+DEFAULT_PLOT_VARS <- c("cM_Mbp", "SYN", "INV", "NLO", "GA", "TE", "CHR", "POS")
+DEFAULT_PLOT_VARS_PARENTAL <- c("cM_Mbp", "SYN", "INV",
+                                "NLO_P1", "GA_P1", "TE_P1", "CHR_P1", "POS_P1",
+                                "NLO_P2", "GA_P2", "TE_P2", "CHR_P2", "POS_P2")
 
 SPOT_COLORS <- c(Hotspot = "red", Coldspot = "blue")
 
@@ -104,17 +107,78 @@ combine_tables <- function(dts) {
 # (split on non-alphanumerics, e.g. "TE_Gypsy_P1" -> TE, GYPSY, P1).
 # Adjust the patterns below if your column names use different prefixes.
 CATEGORY_LEVELS <- c("Structural variants", "Genome", "Transposable elements", "Chromatin", "Repeats",
-                     "Centromeres", "Other")
+                     "Centromeres", "Chromosome position", "Other")
 feature_category <- function(x) {
   tk <- strsplit(toupper(x), "[^A-Z0-9]+")[[1]]
   has <- function(re) any(grepl(re, tk))
   if (has("^CEN[0-9]*$"))                          "Centromeres"
   else if (has("^CHR[0-9]*$|COMPART|EIGEN"))       "Chromatin"
-  else if (has("^REP$|REPEAT"))                    "Repeats"
+  else if (has("^REP$|^RPT[0-9]*$|REPEAT"))        "Repeats"
   else if (has("^TE[0-9]*$"))                      "Transposable elements"
   else if (has("^GA[0-9]*$"))                      "Genome"
   else if (has("^(SYN|SYNAL|HDR|TDM|INV|NLO)$"))   "Structural variants"
+  else if (has("^POS$"))                           "Chromosome position"
   else                                             "Other"
+}
+
+# ---- Feature organisation (variable picker) --------------------------------
+# High-order features in display order; every other feature is low-order.
+HIGH_ORDER <- c("SYN", "INV", "NLO", "GA", "TE", "CHR", "CEN", "RPT", "POS")
+# Category -> short label of its "add" button
+CATEGORY_BUTTONS <- c("Structural variants" = "SV", "Genome" = "GA",
+                      "Transposable elements" = "TE", "Chromatin" = "CHR", "Repeats" = "RPT",
+                      "Centromeres" = "CEN", "Chromosome position" = "POS", "Other" = "Other")
+
+# One row per feature: base name (without _P1/_P2), version (avg = parent average,
+# P1 / P2 = parental, single = no parental versions, e.g. SYN), order and category
+feature_table <- function(features) {
+  par  <- ifelse(grepl("_P[12]$", features), sub("^.*_(P[12])$", "\\1", features), "")
+  base <- ifelse(par == "", features, sub("_P[12]$", "", features))
+  version <- ifelse(par != "", par, ifelse(features %in% base[par != ""], "avg", "single"))
+  data.frame(feature = features, base = base, version = version,
+             level = ifelse(base %in% HIGH_ORDER, "high", "low"),
+             category = factor(vapply(features, feature_category, character(1), USE.NAMES = FALSE),
+                               levels = CATEGORY_LEVELS),
+             stringsAsFactors = FALSE)
+}
+
+# Logical order: category, then high-order averages (and features without parental
+# versions), high-order parental (P1, P2 side by side), low-order averages, low-order parental
+sort_features <- function(features) {
+  if (!length(features)) return(features)
+  ft <- feature_table(features)
+  bord <- match(ft$base, HIGH_ORDER); bord[is.na(bord)] <- length(HIGH_ORDER) + 1L
+  o <- order(as.integer(ft$category), ft$level == "low",
+             ft$version %in% c("P1", "P2"), bord, tolower(ft$base),
+             match(ft$version, c("avg", "single", "P1", "P2")))
+  features[o]
+}
+
+# Features of the given categories in the requested version: "avg" (parent averages;
+# parental features where no average exists), "par" (P1 and P2) or "both"
+pick_features <- function(features, categories, version = "avg", low_order = FALSE) {
+  ft <- feature_table(features)
+  ok <- ft$category %in% categories & (low_order | ft$level == "high")
+  ok <- ok & switch(version,
+    avg  = ft$version %in% c("avg", "single") |
+           (ft$version %in% c("P1", "P2") & !(ft$base %in% ft$feature[ft$version == "avg"])),
+    par  = ft$version %in% c("P1", "P2", "single"),
+    TRUE)
+  ft$feature[ok]
+}
+
+# Selection order shown in the plot: targets first, then features in logical order
+order_selection <- function(sel, targets) {
+  c(intersect(targets, sel), sort_features(setdiff(sel, targets)))
+}
+
+# Grouped choices for selectize inputs (optgroups by category, logical order)
+grouped_choices <- function(features) {
+  f <- sort_features(features)
+  if (!length(f)) return(list())
+  cats <- droplevels(feature_table(f)$category)
+  g <- split(f, cats)
+  lapply(g[lengths(g) > 0], as.list)   # as.list keeps one-item groups as groups
 }
 
 rescale01 <- function(x) {
@@ -457,7 +521,7 @@ draw_pairs <- function(M, R, method = "spearman", g = NULL, labs = NULL) {
 
 # ---- Slide-out documentation panel ------------------------------------------
 doc_css <- "
-.doc-drawer{position:fixed;top:0;right:0;height:100%;width:520px;max-width:92vw;
+.doc-drawer{position:fixed;top:0;right:0;height:100%;width:560px;max-width:92vw;
   background:#fff;box-shadow:-4px 0 18px rgba(0,0,0,.25);z-index:1040;
   transform:translateX(100%);transition:transform .35s ease;}
 .doc-drawer.open{transform:translateX(0);}
@@ -469,8 +533,20 @@ doc_css <- "
 .doc-body{height:100%;overflow-y:auto;padding:20px 24px 60px 24px;font-size:13px;}
 .doc-body h3{margin-top:0;}
 .doc-body h4{margin-top:22px;border-bottom:1px solid #ddd;padding-bottom:4px;}
+.doc-body h5{margin-top:16px;font-weight:700;}
 .doc-close{float:right;cursor:pointer;font-size:22px;line-height:1;color:#666;}
+.doc-table{width:100%;border-collapse:collapse;margin:6px 0 10px 0;font-size:12px;}
+.doc-table th{background:#f3f3f3;text-align:left;}
+.doc-table th,.doc-table td{border:1px solid #ddd;padding:4px 6px;vertical-align:top;}
+.doc-table td:first-child{white-space:nowrap;font-family:monospace;}
 "
+
+# Feature dictionary table: rows = list(c(column, meaning, how it was generated), ...)
+doc_table <- function(rows, head = c("Column", "Meaning", "How it was generated")) {
+  tags$table(class = "doc-table",
+             tags$thead(tags$tr(lapply(head, tags$th))),
+             tags$tbody(lapply(rows, function(r) tags$tr(lapply(r, function(x) tags$td(HTML(x)))))))
+}
 
 doc_drawer <- function() {
   tagList(
@@ -483,131 +559,325 @@ doc_drawer <- function() {
             span(class = "doc-close", HTML("&times;"),
                  onclick = "document.getElementById('doc-drawer').classList.remove('open')"),
             h3("Feature documentation"),
-            
-            h4("Genome-specific feature pairs"),
-            p("For each donor parent, features are provided for each parental genome involved in",
-              "the cross (P1: MbTMV; P2: Pen, Che or MT). Coordinates were converted between the",
-              "two genomes as described in \"Coordinate conversion\" below. For example, \"GA_P1\"",
-              "holds the genome annotations of the recurrent parent (RP) genome, MbTMV, whereas",
-              "\"GA_P2\" holds the annotations of the donor parent (DP) genome projected onto the RP",
-              "coordinates. This applies to every feature except SVs, which depend implicitly on",
-              "the two crossing parents."),
-            
-            h4("Coordinate conversion"),
-            p("Coordinates were converted with a custom script (syri_liftover.py) that combines the",
-              "minimap2 BAM alignment between the two parental genomes with the SyRI annotation of",
-              "that same alignment. The start and end of every interval are converted separately,",
-              "and only syntenic (SYN/SYNAL) and inverted (INV/INVAL) conversions are kept:"),
+
+            # ---- 1. Data sources ------------------------------------------------------
+            h4("1. Data sources"),
+            p("The crossovers, the donor genome assemblies and the gene, TE and repeat",
+              "annotations come from:"),
+            p(tags$a(href = "https://doi.org/10.1038/s41467-026-74784-5", target = "_blank",
+                     "van Rengs WMJ, Fuentes RR, Zangishei Z, Primetis E, et al. (2026). Wild",
+                     "tomato genome assemblies reveal structural variants and repeat content act",
+                     "as recombination barriers. Nature Communications 17: 5590."),
+              " (PubMed ",
+              tags$a(href = "https://pubmed.ncbi.nlm.nih.gov/42365000/", target = "_blank", "42365000"),
+              "; open access on ",
+              tags$a(href = "https://pmc.ncbi.nlm.nih.gov/articles/PMC13310191/", target = "_blank", "PMC"),
+              ")."),
+            tags$ul(
+              tags$li(strong("Crosses."), " MbTMV was crossed with Micro-Tom, S. cheesmaniae",
+                      " LA1039 and S. pennellii LA0716. From each F1 hybrid, a male and a female",
+                      " backcross population were made (six populations, 709 plants; for",
+                      " MbTMV × S. pennellii the female backcross used LA0716 as pollen donor",
+                      " because of unilateral incompatibility)."),
+              tags$li(strong("Crossovers."), " Each backcross plant was sequenced at low",
+                      " coverage (Illumina NovaSeq 6000, Tn5 libraries, 2.5–5 Gbp per plant),",
+                      " reads were aligned to MbTMV (BWA-MEM, duplicates removed) and genotyped",
+                      " at parental SNPs called from the parental HiFi reads and checked in F1",
+                      " Illumina data. Crossovers were called with MeiCOfi (500 kb windows, 250 kb",
+                      " step, at least 30 SNPs). Here, only crossovers with intervals < 5 kb are",
+                      " used (Number_of_COs)."),
+              tags$li(strong("Genome assemblies."), " Only the 12 chromosomes of each assembly",
+                      " are used (unplaced sequence removed).",
+                tags$ul(
+                  tags$li(em("S. cheesmaniae"), " LA1039 and ", em("S. pennellii"), " LA0716",
+                          " (van Rengs et al., 2026; ENA PRJEB62444 and PRJEB62445): PacBio HiFi",
+                          " (Sequel II), ONT (PromethION, R10.4) and Omni-C reads. Contigs from",
+                          " hifiasm (v0.16.1 for LA1039, HiFi only; v0.17.6 for LA0716, HiFi plus",
+                          " ONT reads > 90 kb), scaffolded with Omni-C (esrice/hic-pipeline, SALSA",
+                          " v2.2) and curated manually in Juicebox."),
+                  tags$li("Moneyberg-TMV (",
+                          tags$a(href = "https://doi.org/10.1111/tpj.15690", target = "_blank",
+                                 "van Rengs et al., 2022, Plant J 110: 572–588"),
+                          "; GCA_915070445.1, ENA PRJEB44956): a long-read-only assembly without",
+                          " scaffolding. PacBio HiFi reads were assembled with hifiasm v0.14.2 and",
+                          " HiCanu (Canu v2.1.1), ONT reads with Flye v2.8.2 and NECAT (polished",
+                          " with Medaka). Each pair was merged with quickmerge, the ONT merge was",
+                          " polished with HiFi reads (Racon), and the ONT and HiFi merges were",
+                          " merged again. The 12 chromosomes are 12 gap-free contigs (98.9% of the",
+                          " assembly, N50 68.5 Mbp); the remaining 8.6 Mbp is concatenated as chr00.",
+                          " Omni-C data confirmed the chromosome structure."),
+                  tags$li("Micro-Tom (",
+                          tags$a(href = "https://doi.org/10.5061/dryad.h9w0vt4qd", target = "_blank",
+                                 "van Rengs, Fuentes & Underwood, 2023, Dryad"),
+                          "; file MT_denovo_genome.fasta; reads ENA PRJEB62441): PacBio HiFi reads",
+                          " assembled with hifiasm v0.16.1, scaffolded with Omni-C (esrice/hic-pipeline,",
+                          " SALSA2 v2.2) and corrected in several rounds of manual curation. It is the",
+                          " MPIPZ (Underwood lab) assembly, first released with ",
+                          tags$a(href = "https://doi.org/10.1038/s41588-024-01750-6", target = "_blank",
+                                 "Wang Y et al. (2024, Nature Genetics)"),
+                          " and also used by van Rengs et al. (2026). It is not the Micro-Tom",
+                          " assembly of Wang S et al. (2024, J Genet Genomics)."))),
+              tags$li(strong("Gene annotation (GA)."), " Helixer ab initio predictions, combined",
+                      " for MbTMV and LA0716 with RNA-seq and Iso-Seq transcript evidence",
+                      " (HISAT2, minimap2, StringTie, Portcullis) in Mikado, which groups",
+                      " overlapping models into superloci; LA1039 genes are Helixer predictions.",
+                      " No gene annotation is published with the Micro-Tom assembly, so the MbTMV",
+                      " annotation is used for Micro-Tom as well. The original Micro-Tom gene",
+                      " annotation has been requested from the authors."),
+              tags$li(strong("Transposable elements (TE)."), " EDTA v2.0.1 (intact elements;",
+                      " LTR superfamilies checked with TEsorter)."),
+              tags$li(strong("Repeats (RPT)."), " Repeat score from Context Tree Weighting",
+                      " (per-base sequence probability; high = repetitive) together with tandem",
+                      " repeats from TRASH."),
+              tags$li(strong("Structural variants."), " The paper used minimap2 (-ax asm5) and",
+                      " SyRI v1.6. The SV features here were re-called with SyRI v1.8.2 on",
+                      " minimap2 v2.31 alignments (-x asm5 for Micro-Tom, -x asm20 for the wild",
+                      " species), in both directions (section 3)."),
+              tags$li(strong("Not from the paper."), " The centromere coordinates (CEN) and the",
+                      " Hi-C chromatin compartments (CHR) were provided by Elias.")),
+
+            # ---- 2. Feature dictionary ------------------------------------------
+            h4("2. Feature dictionary"),
+            p("Every row of the data is one genomic window (bin) in the coordinates of the",
+              "recurrent parent genome, MbTMV (S. lycopersicum cv. Moneyberg-TMV), for one cross",
+              "(MbTMV × donor parent) and one meiosis sex. Windows slide along each chromosome",
+              "(window size W, step S, as in the file name, e.g. W100000_S50000), so neighbouring",
+              "windows overlap. Features are grouped into high-order features, which summarise a",
+              "whole category, and low-order features, the individual annotation types they are",
+              "built from. Only the structural variant (SV), genome annotation (GA) and",
+              "transposable element (TE) categories have low-order features."),
+
+            h5("Target: recombination rate"),
+            doc_table(list(
+              c("cM_Mbp", "Recombination rate of the window (cM/Mb).",
+                "Number_of_COs / Number_of_hybrids × 100 / (window length in Mb), computed per donor parent and sex."),
+              c("cM_Mbp_sex_avg", "Sex-averaged recombination rate.",
+                "Equal to cM_Mbp for female (Male = 0) and male (Male = 1) rows; for Male = NA rows, the unweighted mean of the female and male rates of the same window and donor."),
+              c("Number_of_COs", "Crossovers in the window.",
+                "Crossovers of Rengs et al. (2026) with CO intervals &lt; 5 kb, in MbTMV coordinates. Each CO is assigned to the midpoint of its interval and counted in every window containing that midpoint (so one CO is counted in W/S overlapping windows)."),
+              c("Number_of_hybrids", "Gametes (hybrids) analysed for that donor and sex.",
+                "Distinct hybrids in the dataset; all are assumed informative in all windows. For Male = NA, both sexes are summed."),
+              c("Expected_COs, Obs_exp_ratio, Poisson_p", "COs expected under a uniform rate, observed/expected ratio and two-sided exact Poisson p-value.",
+                "Expected = chromosome CO total (from non-overlapping windows only) × window length / chromosome length, per donor, sex and chromosome. Used for hotspot / coldspot calls."))),
+
+            h5("Genome-specific feature pairs (P1 / P2)"),
+            p("Each cross involves two parental genomes, and the same kind of annotation can",
+              "differ between them. Therefore most features come in pairs:"),
+            tags$ul(
+              tags$li(strong("_P1"), " – annotations of the recurrent parent genome, MbTMV,",
+                      " in its own coordinates (e.g. GA_P1 = MbTMV gene annotation)."),
+              tags$li(strong("_P2"), " – annotations of the donor parent genome of that cross",
+                      " (S. cheesmaniae LA1039, S. pennellii LA0716 or MicroTom), projected onto the",
+                      " MbTMV coordinates (e.g. GA_P2 = Cheesmaniae gene annotation in the",
+                      " MbxChe rows).")),
+            p("So GA_P1 and GA_P2 of the same window describe the two homologous chromosome",
+              "segments that pair in meiosis. Both members of a pair are converted between the",
+              "two genomes (section 3), so both are only recorded where the two genomes are",
+              "placed by the same rules (sections 3 and 4). The SV features SYN, INV and their",
+              "low-order features have no P1/P2 version: they describe the relationship between",
+              "the two genomes, so they belong to the cross rather than to one parent. NLO is the",
+              "exception: NLO_P1 and NLO_P2 describe the non-locally orthologous sequence of each",
+              "parent separately."),
+
+            h5("Parent averages"),
+            p("For every pair, the table also contains the parent average under the plain",
+              "name: GA = (GA_P1 + GA_P2) / 2, and likewise TE, CHR, CEN, RPT, POS, NLO and each",
+              "low-order GA_* and TE_* feature. It is computed per window; when one of the two",
+              "parental values is missing, the other one is used. The averages summarise both",
+              "homologues with a single value and are the variables plotted by default; the",
+              "parental versions remain available to compare the two genomes."),
+
+            h5("High-order features"),
+            p("Unless stated otherwise, values are the fraction of the window covered by the",
+              "feature (0–1), after merging overlapping intervals of the same feature with",
+              "bedtools, e.g. CEN_P1 = 0.80 means that 80% of the window is centromeric in MbTMV.",
+              "Features listed as _P1, _P2 also have a parent average without suffix (see above)."),
+            doc_table(list(
+              c("SYN", "Structural variant: syntenic region.",
+                "SyRI annotation SYN (column 11 of the SyRI .out file). Syntenic regions are locally orthologous between the homologous chromosomes, so they align properly during synapsis, which enables recombination. They can contain syntenic alignments (SYNAL), highly divergent regions (HDR) and tandem repeats (TDM)."),
+              c("INV", "Structural variant: inversion.",
+                "SyRI annotation INV, ≥ 10 bp. Inversions pair by forming an inverted loop, so a gamete resulting from a crossover within the region is non-viable."),
+              c("NLO_P1", "Structural variant: non-locally orthologous MbTMV sequence.",
+                "MbTMV sequence without a 1-to-1 orthologous sequence at the same location on the donor homologue, so it cannot align during synapsis and is non-recombinogenic. Union of SyRI translocations (TRANS), inverted translocations (INVTR) and copy losses (CPL), ≥ 10 bp (MbTMV length), already in MbTMV coordinates."),
+              c("NLO_P2", "Structural variant: non-locally orthologous donor sequence.",
+                "Donor sequence without a local ortholog in MbTMV: translocations (TRANS), inverted translocations (INVTR), duplications and inverted duplications with copy gain or loss (DUP, INVDP) and copy gains (CPG), ≥ 10 bp (donor length). Taken in donor coordinates from the SyRI output and placed onto MbTMV by gap interpolation (section 3), i.e. where it sits along the homologous chromosome. Because such sequence has no counterpart in MbTMV, it often lands in a short MbTMV stretch and covers little of the window (section 4). Kept separate from NLO_P1 to test whether it adds information."),
+              c("GA_P1, GA_P2", "Genome annotation.",
+                "Union of all genome-annotation subsets (see GA low-order features) of the GFF3 annotations of Rengs et al. (2026)."),
+              c("TE_P1, TE_P2", "Transposable elements.",
+                "Union of all TE subsets (see TE low-order features) of the EDTA intact TE annotations of each genome."),
+              c("CHR_P1, CHR_P2", "Chromatin compartment.",
+                "Hi-C compartment score provided by Elias: eigenvector of a PCA of the Hi-C contact matrix, signed by its correlation with gene content, so values run from −1 to 1 and positive values mean active (A) chromatin. Numeric value of the overlapping interval, not a fraction."),
+              c("CEN_P1, CEN_P2", "Centromeric region.",
+                "Centromere coordinates provided by Elias. Converted with the syntenic fallback (section 5)."),
+              c("RPT_P1, RPT_P2", "Repeat score.",
+                "Repeat annotation of Rengs et al. (2026): a score for the likelihood of a repetitive region (high = repetitive). Numeric value of the overlapping interval, not a fraction."),
+              c("POS_P1, POS_P2", "Relative chromosome position.",
+                "Position of the window midpoint along its chromosome arm, from ~0 (telomere) to 1 (centromere), computed from CEN_P1 or CEN_P2 per chromosome and cross (see Notes)."))),
+
+            h5("Low-order features"),
+            p(strong("Structural variants (SV)"), " – sub-annotations of SYN, from the SyRI .out",
+              "file (no length filter):"),
+            doc_table(list(
+              c("SYNAL", "Syntenic alignment", "Aligned blocks within syntenic regions."),
+              c("HDR", "Highly divergent region", "Syntenic stretches too divergent to align."),
+              c("TDM", "Tandem repeat", "Tandem repeats within syntenic regions."))),
+            p(strong("Genome annotation (GA)"), " – one feature per GFF3 feature type",
+              "(column 3), each with a _P1 and _P2 version:"),
+            doc_table(list(
+              c("GA_gene", "Protein-coding gene", ""),
+              c("GA_mRNA", "Transcript (mRNA)", ""),
+              c("GA_exon", "Exon", ""),
+              c("GA_CDS", "Coding sequence", ""),
+              c("GA_five_prime_UTR", "5' untranslated region", ""),
+              c("GA_three_prime_UTR", "3' untranslated region", ""),
+              c("GA_ncRNA_gene", "Non-coding RNA gene", ""),
+              c("GA_ncRNA", "Non-coding RNA", ""),
+              c("GA_superlocus", "Superlocus (group of overlapping gene models)", "See note below.")),
+              head = c("Column", "Meaning", "")),
+            p(em("Note on GA_superlocus."), " Superloci are Mikado containers: each one",
+              " spans a group of overlapping (or nearly adjacent) gene models. Overlapping",
+              " superloci are merged with bedtools merge before computing coverage, so they",
+              " are not counted twice. Their coverage is mostly gene coverage plus the small",
+              " gaps between the loci they join (100 kb windows: mean coverage ~0.18 for",
+              " superloci vs ~0.16 for GA_gene), so the feature is probably redundant with",
+              " GA_gene/GA_mRNA; check their correlation in the pairs plot. It is also not",
+              " available for every genome: in the current tables GA_superlocus_P2 is 0",
+              " everywhere for the Cheesmaniae and Pennellii crosses and present only for",
+              " MicroTom, so the parent average for those two crosses is just half the MbTMV",
+              " value. The feature is kept for exploration, but in a model pooled across",
+              " crosses it can act as a proxy for the cross rather than for biology, so",
+              " consider leaving it out of the ML feature sets."),
+            p(strong("Transposable elements (TE)"), " – one feature per EDTA feature type,",
+              "each with a _P1 and _P2 version:"),
+            doc_table(list(
+              c("TE_LTR_retrotransposon", "LTR retrotransposon (unclassified)", ""),
+              c("TE_Copia_LTR_retrotransposon", "Copia LTR retrotransposon", ""),
+              c("TE_Gypsy_LTR_retrotransposon", "Gypsy LTR retrotransposon", ""),
+              c("TE_long_terminal_repeat", "Long terminal repeat of an LTR element", ""),
+              c("TE_target_site_duplication", "Target site duplication", ""),
+              c("TE_repeat_region", "Repeat region (full element including LTRs)", ""),
+              c("TE_CACTA_TIR_transposon", "CACTA DNA transposon (TIR)", ""),
+              c("TE_hAT_TIR_transposon", "hAT DNA transposon (TIR)", ""),
+              c("TE_Mutator_TIR_transposon", "Mutator DNA transposon (TIR)", ""),
+              c("TE_PIF_Harbinger_TIR_transposon", "PIF/Harbinger DNA transposon (TIR)", ""),
+              c("TE_Tc1_Mariner_TIR_transposon", "Tc1/Mariner DNA transposon (TIR)", ""),
+              c("TE_helitron", "Helitron (rolling-circle transposon)", "")),
+              head = c("Column", "Meaning", "")),
+
+            # ---- 3. Coordinate conversion --------------------------------------
+            h4("3. Coordinate conversion"),
+            p("SVs were called with SyRI (v1.8.2) on genome-wide minimap2 (v2.31-r1302) alignments",
+              "between the two parental genomes of each cross (-x asm5 for MicroTom, -x asm20 for",
+              "Cheesmaniae and Pennellii, to accommodate their sequence divergence)."),
+            p("All other features were converted between the two genomes with a custom script",
+              "(syri_liftover.py) that combines the minimap2 BAM alignment of the two genomes with",
+              "the full SyRI annotation of that same alignment. The conversion was run in both",
+              "directions: donor features were projected onto MbTMV (P2), and MbTMV features onto",
+              "the donor genome (P1). The start and end of every interval are converted",
+              "separately, one chromosome at a time. Each position is projected through all",
+              "alignments, but only syntenic (SYN/SYNAL) and inverted (INV/INVAL) conversions are",
+              "kept:"),
             tags$ul(
               tags$li(strong("Exact"), " – the position lies in an aligned block of a syntenic",
                       " or inverted alignment and is converted base-to-base using the alignment",
                       " (CIGAR). Alignments that SyRI did not report but that lie completely inside",
-                      " a SYN or INV region on both genomes are also used."),
+                      " a SYN or INV region are also used."),
               tags$li(strong("Interpolated"), " – the position lies inside a SYN or INV region",
-                      " but in a stretch without alignment (e.g. a highly divergent region or a",
-                      " deletion). Its coordinate is interpolated linearly between the closest",
-                      " aligned bases on either side within the region."),
-              tags$li(strong("Not converted"), " – positions outside every SYN and INV region",
-                      " (translocations, duplications, unaligned regions) get no coordinate, and",
-                      " the interval is dropped. The exception is centromeric regions (see",
-                      " \"Syntenic fallback\").")),
-            p("Intervals in inversions are reported with start < end in the target genome.",
-              "When several syntenic or inverted conversions exist for one position, the one on",
-              "the same chromosome closest to the original position is kept. Positions within",
-              "50 bp of a chromosome end are mapped to the corresponding end of the homologous",
-              "chromosome. Every candidate conversion (including translocated and duplicated",
-              "alignments that were not used) is recorded in a log file next to each feature",
-              "file (*_conversion_hits.tsv.gz), together with its SyRI annotation and the method",
-              "used."),
-            
-            h4("Syntenic fallback"),
-            p("For centromeric regions only, a boundary that falls outside every SYN and INV",
-              "region is moved to the closest syntenic or inverted aligned base: upstream for the",
-              "interval start and downstream for the interval end. That base is then converted",
-              "exactly. The rationale is that every genome must contain at least one centromeric",
-              "region, and expanding the interval because of the missing direct mapping is not",
-              "expected to have a large impact, since tomato centromeres are surrounded by long",
-              "stretches of heterochromatin, which also inhibits CO formation."),
-            
-            h4("Structural variant features"),
-            p("Structural variant features were extracted from SyRI (v1.8.2) annotations of",
-              "genome-wide minimap2 (v2.31-r1302) alignments between the reference genomes of the",
-              "parents in each cross. Sequence divergence was accommodated per species (-x asm5 for",
-              "MicroTom, -x asm20 for Cheesmaniae and Pennellii). SV features comprise three",
-              "high-order features (SYN, INV and NLO) and five low-order features (SYNAL, HDR, TDM,",
-              "INV and NLO). High-order features are categorized by the expected outcome of",
-              "recombination:"),
-            tags$ul(
-              tags$li(strong("Syntenic regions (SYN)"), " align properly during synapsis because",
-                      " they are locally orthologous between the homologous chromosomes, which",
-                      " enables recombination. They come from SyRI annotation SYN (column 11 of the",
-                      " SyRI .out file) and may contain syntenic alignments (SYNAL), highly",
-                      " divergent regions (HDR) or tandem repeats (TDM)."),
-              tags$li(strong("Inversions (INV)"), " align by forming an inverted loop, so a gamete",
-                      " resulting from any crossover within the region is non-viable. Inversions",
-                      " correspond to the value INV in column 11 of the SyRI .out file."),
-              tags$li(strong("Non-locally orthologous regions (NLO)"), " lack a 1-to-1 orthologous",
-                      " sequence at the same location on the homologous pair. For example,",
-                      " translocated copies have an ortholog elsewhere in the homologous genome, but",
-                      " not at the same location, so they cannot align properly during synapsis and",
-                      " are therefore non-recombinogenic. NLO regions contain the annotations",
-                      " translocations (TRANS), inverted translocations (INVTR), copy loss (CPL),",
-                      " duplications (DUP) with copy loss in the reference, and inverted duplications",
-                      " (INVDP) with copy loss in the reference (MbTMV is the reference). SVs with a",
-                      " copy gain in the query (Che, Pen, MT) do not interrupt synteny in the MbTMV",
-                      " coordinate system and were discarded. In these cases, the MbTMV sequences",
-                      " flanking the insertion point are neighbors and can align with their homologs",
-                      " despite the intervening SV, whereas only the insertion in the homolog cannot",
-                      " recombine, because no homologous sequence exists in MbTMV.")),
-            
-            h4("Feature categories"),
-            tags$ul(
-              tags$li(strong("Genome (GA)"), " – genome annotations, as the fraction of the",
-                      " window covered."),
-              tags$li(strong("Transposable elements (TE)"), " – transposable element",
-                      " annotations, as the fraction of the window covered."),
-              tags$li(strong("Chromatin"), " – chromatin compartments, given as Hi-C PCA",
-                      " eigenvectors from -1 to 1 (positive = active chromatin)."),
-              tags$li(strong("Repeats"), " – repeat annotation score; high values indicate",
-                      " repetitive regions."),
-              tags$li(strong("Centromeres (CEN)"), " – centromeric regions, as the fraction of",
-                      " the window covered."),
-              tags$li(strong("Relative chromosome position (POS)"), " – position of the window",
-                      " along its chromosome arm, from 0 (telomere) to 1 (centromere).")),
-            p("Structural variant (SV) features are described above."),
-            
-            h4("Interpretation of the feature values"),
-            p("The genome annotations (GA) and transposable elements (TE) were taken from the",
-              "annotations presented by Rengs et al., 2026. The centromeric regions were provided",
-              "by Elias. All these features (GA*, TE*, CEN*, CHR*) and their low-order features are",
-              "quantified as the fraction of the genomic window covered by the corresponding",
-              "landmark. For example, CEN_P1 = 0.80 means that 80% of the window in the recurrent",
-              "parent genome is covered by centromeric regions."),
-            p("The chromatin compartments were also provided by Elias. They are quantified as the",
-              "eigenvectors of a PCA of the Hi-C distance matrix. Signs were assigned based on the",
-              "correlation with gene content, so values span -1 to 1, with positive values",
-              "reflecting active chromatin. Repeat annotations (Rengs et al., 2026) are quantified",
-              "as a score for the likelihood of a repetitive region, with high values meaning",
-              "repeats."),
-            p("The relative chromosome position (POS_P1, POS_P2) is computed from the window",
-              "midpoint and the centromere defined by CEN_P1 or CEN_P2, separately for each",
-              "chromosome and cross. On the left arm, it is the distance from the start of the",
-              "chromosome divided by the distance from there to the midpoint of the first window",
-              "with CEN = 1; on the right arm, the same is measured from the end of the chromosome",
-              "back to the midpoint of the last window with CEN = 1. All windows between the first",
-              "and the last CEN = 1 window are set to 1, so a patchy centromere counts as one block.",
-              "Because the telomere is taken as the start of the first window, the first window",
-              "never reaches exactly 0. Chromosomes without any window with CEN = 1 get NA."),
-            
+                      " but in a stretch without alignment (gaps, HDRs, deletions). Its coordinate",
+                      " is interpolated linearly between the closest aligned bases on either side",
+                      " within the region."),
+              tags$li(strong("Gap-interpolated"), " – the position lies outside every SYN and",
+                      " INV region (a translocation, duplication, copy gain or loss, or an unaligned",
+                      " stretch). It is interpolated linearly between the closest SYN/INV aligned",
+                      " base upstream and the closest one downstream, i.e. placed proportionally",
+                      " across the non-syntenic gap on the homologous chromosome (section 4). The",
+                      " two anchors must lie on the homologous chromosome and, if they have the same",
+                      " orientation, in the expected order; an anchor pair spanning a SYN–INV",
+                      " boundary is accepted. There is no limit on the gap size."),
+              tags$li(strong("Not converted"), " – positions without a valid anchor pair (no",
+                      " anchor on one side, anchors on different chromosomes or in the wrong order)",
+                      " get no coordinate, and the interval is dropped. For centromeres, the",
+                      " syntenic fallback is used instead (section 5).")),
+            p("When several syntenic or inverted conversions exist for one position, the one on",
+              "the same chromosome closest to the original position is kept. Positions below 1 or",
+              "within 50 bp of a chromosome end are mapped to the corresponding end of the",
+              "homologous chromosome. Intervals in inversions are reported with start < end in the",
+              "target genome. Every candidate conversion (including translocated and duplicated",
+              "alignments that were not used) is recorded with its SyRI type and method (exact,",
+              "interpolated, gap_interp, fallback) in a log",
+              "file next to each feature file (*_conversion_hits.tsv.gz). Finally, unconverted and",
+              "duplicated intervals are removed, coordinates are set to 0-based half-open, the",
+              "MbTMV coordinates are placed first, and overlapping intervals are merged before the",
+              "features are intersected with the windows."),
+
+            # ---- 4. Features outside syntenic and inverted regions ---------------
+            h4("4. Features outside syntenic and inverted regions"),
+            p("The conversion is symmetric: donor features are projected onto MbTMV (P2) and",
+              "MbTMV features onto the donor genome (P1), and a feature is only kept if both of",
+              "its ends can be placed. Features in regions that are neither syntenic nor inverted",
+              "between the parents (translocations, duplications, copy gains or losses, unaligned",
+              "stretches) are placed by gap interpolation: proportionally between the flanking",
+              "syntenic or inverted anchors."),
+            p("The result describes what lies across from a position on the homologous",
+              "chromosome, which is what the two homologues bring together at synapsis, rather",
+              "than where the feature's orthologous sequence is (that may be elsewhere in the",
+              "genome). This keeps many features that would otherwise be dropped, especially in",
+              "unaligned or highly rearranged regions. Whether these regions can recombine is",
+              "still described separately by the SV features (SYN, INV, NLO_P1, NLO_P2), so a",
+              "model can learn that a window covered by NLO or INV does not recombine regardless",
+              "of the annotations placed there."),
+            p("Gaps of very different size on the two genomes are stretched or compressed. When",
+              "a long donor insertion faces a short MbTMV stretch (a deletion in MbTMV), all of",
+              "its features land in that short stretch. Coverage features still stay between 0",
+              "and 1, because the intervals of each feature are merged before they are",
+              "intersected with the windows, but the inserted sequence then covers only a small",
+              "part of the window. This is consistent with the target: the inserted sequence has",
+              "no homologous MbTMV sequence to pair with, so no crossover can occur within it.",
+              "For CHR and RPT, which are numeric values rather than coverage, several compressed",
+              "intervals can fall in the same window."),
+            p("Every gap-interpolated end is labelled gap_interp in the conversion log",
+              "(*_conversion_hits.tsv.gz), together with the size of the gap on each genome and",
+              "the two anchors, so these features can be counted, filtered or compared with the",
+              "strictly syntenic conversion."),
+            p(em("Check: GA_P1 against the MbTMV GFF3 binned in the same 100 kb windows (50 kb",
+                 "step): Pearson r without \u2192 with gap interpolation = 0.906 \u2192 0.976",
+                 "(Cheesmaniae), 0.970 \u2192 0.979 (MicroTom), 0.844 \u2192 0.966 (Pennellii);",
+                 "windows losing > 5% coverage: 9.2 \u2192 1.3%, 2.3 \u2192 1.0%, 21.5 \u2192 1.8%",
+                 "(compare_ga_with_annotation.py).")),
+
+            # ---- 5. Syntenic fallback ------------------------------------------
+            h4("5. Syntenic fallback (centromeres only)"),
+            p(strong("The syntenic fallback was applied only to the centromeric regions (CEN);"),
+              "all other features use the conversion of sections 3 and 4."),
+            p("The coordinates of the donor (P2) centromeres had to be projected to MbTMV (and the",
+              "MbTMV centromeres to the donor genome). Centromeres are often not syntenic between",
+              "the parents. Their boundaries are first placed by gap interpolation like any other",
+              "feature. Only when that is not possible (e.g. no syntenic or inverted anchor on one",
+              "side), the boundary is moved to the closest syntenic or inverted aligned base",
+              "– upstream for the start and downstream for the end – and that base is",
+              "converted exactly, so that no centromere is lost."),
+            p("The rationale is that every chromosome must contain a centromere, and enlarging",
+              "the interval to the nearest syntenic anchor is not expected to have a large impact:",
+              "tomato centromeres are surrounded by long stretches of heterochromatin, which also",
+              "suppress crossover formation."),
+
+            # ---- Notes -----------------------------------------------------------
             h4("Notes"),
             tags$ul(
               tags$li("When collecting data, I assumed that intervals were 0-based half-open for BED",
-                      " files and 1-based closed for GFF/GFF3 files."),
-              tags$li("Features are only converted through syntenic and inverted regions, so",
-                      " features of the donor genome that sit in translocations or duplications are",
-                      " absent from the P2 features. The SV features (INV, NLO) still describe these",
-                      " regions, so the ML models can learn that they are strong predictors of no",
-                      " recombination. In fact, the INV/NLO signal appears very clear in coldspots."),
+                      " files and 1-based closed for GFF/GFF3 files and SyRI .out files."),
+              tags$li("Features in translocations, duplications and unaligned regions are placed",
+                      " by gap interpolation (section 4). The SV features (INV, NLO_P1, NLO_P2)",
+                      " still mark these regions, so the ML models can learn that they are strong",
+                      " predictors of no recombination. In fact, the INV/NLO signal appears very",
+                      " clear in coldspots."),
+              tags$li("Relative chromosome position (POS): on the left arm, the distance from the",
+                      " chromosome start divided by the distance from there to the midpoint of the",
+                      " first window with CEN = 1; on the right arm, the same measured from the",
+                      " chromosome end back to the midpoint of the last window with CEN = 1. All",
+                      " windows between the first and the last CEN = 1 window are set to 1, so a",
+                      " patchy centromere counts as one block. The first window never reaches",
+                      " exactly 0. Chromosomes without any window with CEN = 1 get NA."),
               tags$li("This app and its content are at an early stage. Any comment or idea for",
                       " improvement is very welcome."))
         )
@@ -675,9 +945,22 @@ main_ui <- fluidRow(
       helpText("Male values: 0 = female meiosis, 1 = male meiosis, NA = both sexes combined."),
       selectInput("dataset", "Dataset", choices = NULL),
       selectizeInput("ys", "Variables to plot (y)", choices = NULL, multiple = TRUE),
-      div(style = "margin-bottom:10px;",
+      div(style = "margin-bottom:6px;",
           actionButton("ys_all", "Select all", class = "btn-sm"),
           actionButton("ys_none", "Clear variables", class = "btn-sm")),
+      div(style = "border:1px solid #ddd;border-radius:4px;padding:6px 8px;margin-bottom:10px;background:#fafafa;",
+          tags$small(strong("Add features by category")),
+          radioButtons("ys_version", NULL,
+                       c("Averages" = "avg", "Parental (P1, P2)" = "par", "Both" = "both"),
+                       inline = TRUE),
+          checkboxInput("ys_low", "Include low-order features", FALSE),
+          checkboxInput("ys_sex", "Plot sex-specific recombination rates (female and male cM_Mbp)", FALSE),
+          uiOutput("ys_cat_buttons"),
+          tags$small(strong("Selected features: show")),
+          div(actionButton("ys_to_avg", "Averages", class = "btn-xs"),
+              actionButton("ys_to_par", "Parental", class = "btn-xs"),
+              actionButton("ys_sort", "Sort", class = "btn-xs",
+                           title = "Order the selected variables by category"))),
       actionButton("dist_open", "Show distributions & correlations",
                    icon = icon("chart-column"), class = "btn-primary btn-sm",
                    style = "margin-bottom:10px;"),
@@ -742,6 +1025,9 @@ main_ui <- fluidRow(
         uiOutput("dv_note"),
         hr(),
         h4("Distributions"),
+        checkboxInput("dv_hide_outliers",
+                      "Hide outliers in the boxplots (display only; boxes, whiskers and n are unchanged)",
+                      FALSE),
         plotOutput("dv_box", height = "auto"),
         hr(),
         h4("Pairwise correlations \u2013 all bins"),
@@ -756,7 +1042,15 @@ main_ui <- fluidRow(
   )
 )
 
+# DataTables JS/CSS, loaded with the page. Without this, the library is only
+# fetched when the first table is drawn, and tables that arrive at the same time
+# fail with "$table.DataTable is not a function" (only the header is shown).
+dt_deps <- htmltools::attachDependencies(
+  tags$div(style = "display:none;"),
+  htmltools::findDependencies(DT::datatable(data.frame(x = 1))))
+
 ui <- fluidPage(
+  dt_deps,
   titlePanel("The recombination landscape of tomato crosses – An exploratory analysis"),
   tags$button(
     type = "button", class = "btn btn-default btn-sm", style = "margin-bottom:10px;",
@@ -797,15 +1091,13 @@ server <- function(input, output, session) {
     present <- intersect(names(lab), present)
     updateSelectInput(session, "male", choices = setNames(present, lab[present]))
     fc <- feature_cols()
-    cats <- factor(vapply(fc$features, feature_category, character(1), USE.NAMES = FALSE),
-                   levels = CATEGORY_LEVELS)
-    ch <- c(list(Targets = fc$targets), split(fc$features, cats))
-    ch <- lapply(ch[lengths(ch) > 0], as.list)   # as.list: keeps one-item groups as groups
-    sel <- intersect(DEFAULT_PLOT_VARS, c(fc$targets, fc$features))
+    fch <- grouped_choices(fc$features)
+    ch <- c(if (length(fc$targets)) list(Targets = as.list(fc$targets)), fch)
+    avail <- c(fc$targets, fc$features)
+    sel <- if (any(c("GA", "TE", "CHR", "POS") %in% avail)) intersect(DEFAULT_PLOT_VARS, avail)
+           else intersect(DEFAULT_PLOT_VARS_PARENTAL, avail)
     if (!length(sel)) sel <- c(head(fc$targets, 1), head(fc$features, 2))
     updateSelectizeInput(session, "ys", choices = ch, selected = sel)
-    fch <- split(fc$features, cats)
-    fch <- lapply(fch[lengths(fch) > 0], as.list)
     curs <- isolate(input$dv_split)
     updateSelectizeInput(session, "dv_split", choices = c(list("No split" = "none"), fch),
                          selected = if (isTRUE(curs %in% fc$features)) curs else "none")
@@ -821,10 +1113,59 @@ server <- function(input, output, session) {
   
   observeEvent(input$ys_all, {
     fc <- feature_cols()
-    updateSelectizeInput(session, "ys", selected = c(fc$targets, fc$features))
+    updateSelectizeInput(session, "ys", selected = order_selection(c(fc$targets, fc$features), fc$targets))
   })
   observeEvent(input$ys_none, {
     updateSelectizeInput(session, "ys", selected = character(0))
+  })
+
+  # One "+ <category>" button per category present in the data
+  output$ys_cat_buttons <- renderUI({
+    present <- intersect(names(CATEGORY_BUTTONS),
+                         as.character(unique(feature_table(feature_cols()$features)$category)))
+    div(style = "margin-bottom:6px;",
+        if ("cM_Mbp" %in% feature_cols()$targets)
+          actionButton("ys_add_target", "+ cM_Mbp", class = "btn-xs",
+                       title = "Add the recombination rate (cM_Mbp)",
+                       style = "margin:0 3px 3px 0;"),
+        lapply(present, function(cat)
+          actionButton(paste0("ys_add_", CATEGORY_BUTTONS[[cat]]), paste("+", CATEGORY_BUTTONS[[cat]]),
+                       class = "btn-xs", title = paste("Add", tolower(cat), "features"),
+                       style = "margin:0 3px 3px 0;")))
+  })
+  observeEvent(input$ys_add_target, {
+    fc <- feature_cols()
+    updateSelectizeInput(session, "ys",
+                         selected = order_selection(union(input$ys, "cM_Mbp"), fc$targets))
+  }, ignoreInit = TRUE)
+  lapply(names(CATEGORY_BUTTONS), function(cat) {
+    observeEvent(input[[paste0("ys_add_", CATEGORY_BUTTONS[[cat]])]], {
+      fc <- feature_cols()
+      new <- pick_features(fc$features, cat, input$ys_version, isTRUE(input$ys_low))
+      updateSelectizeInput(session, "ys",
+                           selected = order_selection(union(input$ys, new), fc$targets))
+    }, ignoreInit = TRUE)
+  })
+
+  # Switch the selected features between parent averages and parental versions
+  observeEvent(input$ys_to_avg, {
+    fc <- feature_cols(); ft <- feature_table(fc$features)
+    avg <- ft$feature[ft$version == "avg"]
+    sel <- input$ys
+    base <- sub("_P[12]$", "", sel)
+    sel <- unique(ifelse(grepl("_P[12]$", sel) & base %in% avg, base, sel))
+    updateSelectizeInput(session, "ys", selected = order_selection(sel, fc$targets))
+  })
+  observeEvent(input$ys_to_par, {
+    fc <- feature_cols()
+    sel <- unlist(lapply(input$ys, function(v) {
+      p <- intersect(paste0(v, c("_P1", "_P2")), fc$features)
+      if (length(p)) p else v
+    }))
+    updateSelectizeInput(session, "ys", selected = order_selection(unique(sel), fc$targets))
+  })
+  observeEvent(input$ys_sort, {
+    updateSelectizeInput(session, "ys", selected = order_selection(input$ys, feature_cols()$targets))
   })
   
   selected <- reactiveVal(integer(0))
@@ -857,11 +1198,33 @@ server <- function(input, output, session) {
     gam <- unique(na.omit(d$Number_of_hybrids))
     n_gam <- max(gam)
     total <- sum(tiled$Number_of_COs, na.rm = TRUE)
+    # Whole cross, genome-wide (GW): all COs of the cross in the genome / all hybrids
+    # of the cross / genome size. Uses the both-sexes rows (Male = NA: COs and hybrids
+    # of both sexes summed); falls back to the selected sex if they are absent.
+    # COs are summed over the non-overlapping tiling of every chromosome; genome
+    # size = sum of the chromosome ends.
+    # Also computed per sex from the female (Male = 0) and male (Male = 1) rows.
+    gw <- function(sex) {
+      g <- subset_rows(raw(), input$donor, sex, input$dataset)
+      if (!nrow(g)) return(list(rate = NA_real_, cos = NA, gam = NA, mb = NA, n_chr = NA))
+      setorder(g, Chr_ID, Interval_start)
+      g_tiled <- g[g[, .I[tile_keep(Interval_start, Interval_end)], by = Chr_ID]$V1]
+      cos <- sum(g_tiled$Number_of_COs, na.rm = TRUE)
+      mb  <- sum(g[, .(len = max(Interval_end)), by = Chr_ID]$len) / 1e6
+      gam <- max(na.omit(g$Number_of_hybrids))
+      list(rate = 100 * cos / gam / mb, cos = cos, gam = gam, mb = mb, n_chr = uniqueN(g$Chr_ID))
+    }
+    gw_both <- gw("NA"); gw_f <- gw("0"); gw_m <- gw("1")
     list(chr = input$chr, donor = input$donor, male = input$male,
          gametes = n_gam, gametes_vary = length(gam) > 1,
          total = total, per_gamete = total / n_gam,
          n_bins = nrow(tiled), n_all = nrow(d),
-         chr_len_mb = max(d$Interval_end) / 1e6)
+         chr_len_mb = max(d$Interval_end) / 1e6,
+         genome_cm_mbp = gw_both$rate, genome_cm_mbp_m = gw_m$rate,
+         genome_cm_mbp_f = gw_f$rate,
+         genome_cos = gw_both$cos, genome_mb = gw_both$mb, n_chr = gw_both$n_chr,
+         genome_gam = gw_both$gam, genome_cos_f = gw_f$cos, genome_gam_f = gw_f$gam,
+         genome_cos_m = gw_m$cos, genome_gam_m = gw_m$gam)
   })
   
   output$stats <- renderTable({
@@ -869,6 +1232,9 @@ server <- function(input, output, session) {
     data.frame(
       Chromosome = s$chr,
       `Donor parent` = s$donor,
+      `GW cross cM/Mbp` = sprintf("%.3f", s$genome_cm_mbp),
+      `GW cross cM/Mbp (male)` = sprintf("%.3f", s$genome_cm_mbp_m),
+      `GW cross cM/Mbp (female)` = sprintf("%.3f", s$genome_cm_mbp_f),
       Meiosis = c("0" = "Female", "1" = "Male", "NA" = "Both sexes")[[s$male]],
       `Gametes (hybrids)` = format(s$gametes, big.mark = ","),
       `Total COs` = format(s$total, big.mark = ","),
@@ -885,8 +1251,14 @@ server <- function(input, output, session) {
       paste0("Each hybrid = one gamete. Total COs are summed over %d non-overlapping bins ",
              "(of %d sliding-window bins) to avoid double counting; a partial bin at the ",
              "chromosome end may be omitted, so the total is approximate. cM/Mbp = COs per gamete per Mb x 100 ",
-             "(1 CO per gamete = 1 Morgan = 100 cM).%s"),
-      s$n_bins, s$n_all,
+             "(1 CO per gamete = 1 Morgan = 100 cM). GW cross cM/Mbp: genome-wide rate of the ",
+             "cross = all COs in the genome / all hybrids of the cross / genome size \u00d7 100 ",
+             "(both sexes: %s COs, %s hybrids, %s chromosomes, %.1f Mb; female: %s COs, %s hybrids; ",
+             "male: %s COs, %s hybrids). The male and female columns use the rows of that sex only.%s"),
+      s$n_bins, s$n_all, format(s$genome_cos, big.mark = ","),
+      format(s$genome_gam, big.mark = ","), s$n_chr, s$genome_mb,
+      format(s$genome_cos_f, big.mark = ","), format(s$genome_gam_f, big.mark = ","),
+      format(s$genome_cos_m, big.mark = ","), format(s$genome_gam_m, big.mark = ","),
       if (s$gametes_vary) " Number_of_hybrids varies between bins; the maximum is used." else ""))
   })
   
@@ -925,12 +1297,35 @@ server <- function(input, output, session) {
                  measure.vars = ys,
                  variable.name = "variable", value.name = "value",
                  variable.factor = FALSE)
-    long[, variable := factor(variable, levels = ys)]
+    long[, panel := variable]
+    # Sex-specific recombination rates: cM_Mbp of the female (Male = 0) and male
+    # (Male = 1) rows of the same windows, each in its own panel after cM_Mbp
+    sex_vars <- character(0)
+    if (isTRUE(input$ys_sex)) {
+      sx <- rbindlist(lapply(c("0", "1"), function(s) {
+        r <- subset_rows(raw(), input$donor, s, input$dataset)[Chr_ID == input$chr]
+        if (!nrow(r) || !"cM_Mbp" %in% names(r)) return(NULL)
+        data.table(.id = d$.id[match(r$Interval_start, d$Interval_start)],
+                   Interval_midpoint = r$Interval_midpoint,
+                   Number_of_COs = if ("Number_of_COs" %in% names(r)) r$Number_of_COs else NA_real_,
+                   variable = if (s == "0") "cM_Mbp_female" else "cM_Mbp_male",
+                   value = r$cM_Mbp)
+      }))
+      if (nrow(sx)) {
+        sex_vars <- unique(sx$variable)
+        sx[, panel := variable]
+        long <- rbind(long, sx, fill = TRUE)
+      }
+    }
+    k <- match("cM_Mbp", ys); if (is.na(k)) k <- 0L
+    panels <- append(ys, sex_vars, after = k)
+    long[, variable := factor(variable, levels = panels)]
+    long[, panel := factor(panel, levels = panels)]
     long[, mid := Interval_midpoint / 1e6]
-    if (overlay) long[, plot_value := rescale01(value), by = variable] else long[, plot_value := value]
+    if (overlay) long[, plot_value := rescale01(value), by = panel] else long[, plot_value := value]
     long[, hover := paste0(variable, "<br>", round(mid, 3), " Mb<br>value: ", signif(value, 4))]
     if ("Number_of_COs" %in% names(long))   # CO count in the tooltip of recombination-rate traces
-      long[variable %in% TARGET_COLS, hover := paste0(hover, "<br>COs: ", Number_of_COs)]
+      long[variable %in% c(TARGET_COLS, sex_vars), hover := paste0(hover, "<br>COs: ", Number_of_COs)]
     
     p <- ggplot()
     
@@ -939,7 +1334,7 @@ server <- function(input, output, session) {
     if (nrow(reg) > 0) {
       rng <- if (overlay) data.table(ymin = 0, ymax = 1)
       else long[, .(ymin = min(plot_value, na.rm = TRUE),
-                    ymax = max(plot_value, na.rm = TRUE)), by = variable]
+                    ymax = max(plot_value, na.rm = TRUE)), by = panel]
       rng[ymin == ymax, `:=`(ymin = ymin - 0.5, ymax = ymax + 0.5)]
       rng[, k := 1]; reg[, k := 1]
       rects <- merge(reg, rng, by = "k", allow.cartesian = TRUE)
@@ -969,17 +1364,22 @@ server <- function(input, output, session) {
       labs(x = "Interval_midpoint (Mb)",
            y = if (overlay) "Value (min-max scaled per variable)" else NULL,
            colour = NULL,
-           title = sprintf("%s | %s | %s", input$chr, cross,
+           title = sprintf("%s | %s | %s%s", input$chr, cross,
                            c("0" = "female meiosis", "1" = "male meiosis",
-                             "NA" = "both sexes")[[input$male]])) +
+                             "NA" = "both sexes")[[input$male]],
+                           if (length(sex_vars)) " (+ female and male cM_Mbp)" else "")) +
       theme_minimal(base_size = 12)
-    if (!overlay) p <- p + facet_wrap(~variable, ncol = 1, scales = "free_y")
+    if (!overlay) p <- p + facet_wrap(~panel, ncol = 1, scales = "free_y")
     
-    h <- if (overlay) 450 else max(350, 210 * length(ys))
+    h <- if (overlay) 450 else max(350, 210 * length(panels))
     pl <- suppressWarnings(plotly_build(
       ggplotly(p, tooltip = "text", source = "main", height = h)))
     pl <- merge_spot_legend(pl)
-    pl %>% layout(uirevision = "keep", dragmode = "zoom") %>%
+    # uirevision keeps zoom / legend state between redraws of the same set of panels;
+    # a new value when the panels change forces plotly to rebuild the subplot layout
+    # (otherwise panels added without changing the selection, e.g. the sex-specific
+    # rates, are not drawn until the selection changes)
+    pl %>% layout(uirevision = paste(c(panels, input$layout), collapse = "|"), dragmode = "zoom") %>%
       event_register("plotly_click") %>%
       event_register("plotly_selected")
   })
@@ -1261,11 +1661,29 @@ server <- function(input, output, session) {
         scale_fill_manual(values = c("Recombination rate (all bins)" = "#e9c46a",
                                      "Recombination rate (recombinogenic bins)" = "#f4a261",
                                      "Feature" = "grey80"), name = NULL)
+    grp_cols <- c("variable", if (split) ".grp" else "kind")
     # n per box, printed above it
-    cnt <- long[, .(n = .N), by = c("variable", if (split) ".grp" else "kind")]
+    cnt <- long[, .(n = .N), by = grp_cols]
     cnt[, lab := paste0("n = ", format(n, big.mark = ",", trim = TRUE))]
+    # Boxes from all values. With "hide outliers", the box statistics are computed
+    # here from every value and drawn as given, without the outlier points, so the
+    # y axis only spans the whiskers; the statistics themselves do not change.
+    box_layer <- if (isTRUE(input$dv_hide_outliers)) {
+      st <- long[, {
+        q <- quantile(value, c(0.25, 0.5, 0.75), names = FALSE)
+        lim <- c(q[1] - 1.5 * (q[3] - q[1]), q[3] + 1.5 * (q[3] - q[1]))
+        inside <- value[value >= lim[1] & value <= lim[2]]
+        list(ymin = min(inside), lower = q[1], middle = q[2], upper = q[3], ymax = max(inside))
+      }, by = grp_cols]
+      geom_boxplot(data = st, stat = "identity", width = 0.6, inherit.aes = FALSE,
+                   mapping = if (split)
+                     aes(x = .grp, ymin = ymin, lower = lower, middle = middle, upper = upper,
+                         ymax = ymax, fill = .grp)
+                   else aes(x = "", ymin = ymin, lower = lower, middle = middle, upper = upper,
+                            ymax = ymax, fill = kind))
+    } else geom_boxplot(outlier.size = 0.6, outlier.alpha = 0.4, width = 0.6)
     base +
-      geom_boxplot(outlier.size = 0.6, outlier.alpha = 0.4, width = 0.6) +
+      box_layer +
       geom_text(data = cnt, vjust = 1.3, size = 3.4, colour = "grey25", inherit.aes = FALSE,
                 mapping = if (split) aes(x = .grp, y = Inf, label = lab)
                           else aes(x = "", y = Inf, label = lab)) +
